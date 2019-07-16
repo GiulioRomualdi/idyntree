@@ -802,7 +802,7 @@ void KinDynComputations::getRobotState(Transform& world_T_base,
         // base_X_inertial \ls^inertial v_base
         base_velocity = pimpl->m_pos.worldBasePos() * pimpl->m_vel.baseVel();
     }
-    
+
 }
 
 void KinDynComputations::getRobotState(iDynTree::VectorDynSize &s,
@@ -1536,6 +1536,77 @@ Vector3 KinDynComputations::getCenterOfMassBiasAcc()
     return comBiasAcc;
 }
 
+Vector6 KinDynComputations::getLinearAngularMomentumBiasAcc()
+{
+    this->computeRawMassMatrixAndTotalMomentum();
+    this->computeBiasAccFwdKinematics();
+
+    // We compute the bias of the center of mass from the bias of the total momentum derivative
+    Wrench totalMomentumBiasInInertialInertial;
+    ComputeLinearAndAngularMomentumDerivativeBias(pimpl->m_robot_model,
+                                                  pimpl->m_linkPos,
+                                                  pimpl->m_linkVel,
+                                                  pimpl->m_linkBiasAcc,
+                                                  totalMomentumBiasInInertialInertial);
+
+    // The total momentum is written in the (inertial,inertial) frame
+    Wrench totalMomentumBias;
+    if(pimpl->m_frameVelRepr == INERTIAL_FIXED_REPRESENTATION)
+    {
+        totalMomentumBias = totalMomentumBiasInInertialInertial;
+    }
+    else if(pimpl->m_frameVelRepr == BODY_FIXED_REPRESENTATION)
+    {
+        Transform world_X_base =  pimpl->m_pos.worldBasePos();
+
+        // notice m_vel.baseVel() is in body fixed
+        Twist inertialTwistWrtBase_InertialFixed = -(world_X_base * getBaseTwist());
+        Wrench linearAngularMomentumInertial = pimpl->m_totalMomentum;
+
+        fromEigen(totalMomentumBias,
+                  toEigen(world_X_base.inverse() * totalMomentumBiasInInertialInertial)
+                  + toEigen(world_X_base.inverse().asAdjointTransformWrench()) * toEigen(inertialTwistWrtBase_InertialFixed.asCrossProductMatrixWrench()) * toEigen(linearAngularMomentumInertial));
+    }
+    else
+    {
+        assert(pimpl->m_frameVelRepr == MIXED_REPRESENTATION);
+
+        Transform world_X_base_mixed(iDynTree::Rotation::Identity(), pimpl->m_pos.worldBasePos().getPosition());
+        Transform base_mixed_X_world(iDynTree::Rotation::Identity(), -pimpl->m_pos.worldBasePos().getPosition());
+
+        Twist base_mixed_twist_inertia_base_mixed;
+        base_mixed_twist_inertia_base_mixed.getAngularVec3().zero();
+        base_mixed_twist_inertia_base_mixed.setLinearVec3(getBaseTwist().getLinearVec3());
+
+        Twist inertia_twist_base_mixed_inertia;
+        inertia_twist_base_mixed_inertia.getAngularVec3().zero();
+        inertia_twist_base_mixed_inertia.setLinearVec3(-getBaseTwist().getLinearVec3());
+        // inertia_twist_base_mixed_inertia = -base_mixed_twist_inertia_base_mixed;
+
+        Wrench linearAngularMomentumInertial = pimpl->m_totalMomentum;
+
+        MatrixDynSize linAngMomentumJacobian_mixedRepresentation;
+        getLinearAngularMomentumJacobian(linAngMomentumJacobian_mixedRepresentation);
+        int rows = linAngMomentumJacobian_mixedRepresentation.rows();
+
+        std::cerr << "inertia_twist_base_mixed_inertia " << inertia_twist_base_mixed_inertia.asCrossProductMatrixWrench().toString()<<std::endl;
+        // std::cerr << "world_X_base_mixed " << world_X_base_mixed.asAdjointTransform().toString()<<std::endl;
+        std::cerr << "A " << toEigen(base_mixed_X_world.asAdjointTransformWrench()) * toEigen(inertia_twist_base_mixed_inertia.asCrossProductMatrixWrench()) << std::endl;
+        // std::cerr << "C " << toEigen(linAngMomentumJacobian_mixedRepresentation).block(0,0,rows,6) * toEigen(baseTwistWrtInertial_mixed.asCrossProductMatrix()) * toEigen(getBaseTwist()) <<std::endl;
+        // std::cerr << "baseTwistWrtInertial_mixed "<< baseTwistWrtInertial_mixed.asCrossProductMatrix().toString() << std::endl;
+        // std::cerr << "baseTwistWrtInertial_mixed_wrench "<< baseTwistWrtInertial_mixed.asCrossProductMatrixWrench().toString() << std::endl;
+
+        fromEigen(totalMomentumBias,
+                  toEigen(base_mixed_X_world * totalMomentumBiasInInertialInertial)
+                  + toEigen(base_mixed_X_world.asAdjointTransformWrench()) * toEigen(inertia_twist_base_mixed_inertia.asCrossProductMatrixWrench()) * toEigen(linearAngularMomentumInertial)
+                  + toEigen(linAngMomentumJacobian_mixedRepresentation).block(0,0,rows,6) * toEigen(base_mixed_twist_inertia_base_mixed.asCrossProductMatrix()) * toEigen(getBaseTwist()));
+    }
+
+    std::cerr << "totalMomentumBias " <<  totalMomentumBias.toString() << std::endl;
+
+    return totalMomentumBias.asVector();
+}
+
 const SpatialInertia& KinDynComputations::KinDynComputationsPrivateAttributes::getRobotLockedInertia()
 {
     return m_linkCRBIs(m_traversal.getBaseLink()->getIndex());
@@ -1815,14 +1886,14 @@ SpatialMomentum KinDynComputations::getCentroidalTotalMomentum()
 
 bool KinDynComputations::getFreeFloatingMassMatrix(MatrixDynSize& freeFloatingMassMatrix)
 {
-    // Compute the body-fixed-body-fixed mass matrix, if necessary 
+    // Compute the body-fixed-body-fixed mass matrix, if necessary
     this->computeRawMassMatrixAndTotalMomentum();
-    
-    // If the matrix has the right size, this should be inexpensive 
+
+    // If the matrix has the right size, this should be inexpensive
     freeFloatingMassMatrix.resize(pimpl->m_robot_model.getNrOfDOFs()+6,pimpl->m_robot_model.getNrOfDOFs()+6);
 
     toEigen(freeFloatingMassMatrix) = toEigen(pimpl->m_rawMassMatrix);
-    
+
     // Handle the different representations
     pimpl->processOnRightSideMatrixExpectingBodyFixedModelVelocity(freeFloatingMassMatrix);
     pimpl->processOnLeftSideBodyFixedBaseMomentumJacobian(freeFloatingMassMatrix);
@@ -2158,4 +2229,3 @@ bool KinDynComputations::inverseDynamicsInertialParametersRegressor(const Vector
 }
 
 }
-
